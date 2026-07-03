@@ -719,6 +719,13 @@ bool AkVCam::IpcBridgePrivate::frameRequired(const std::string &deviceId,
     }
 
     auto &slot = this->m_broadcasts[deviceId];
+    // MLFBT fix: release the global broadcasts mutex BEFORE waiting up to 1s
+    // for a frame. The original code held m_broadcastsMutex across the wait,
+    // which serialized every device's frame delivery (and every producer
+    // write(), which also takes this mutex) through a single lock -- so only
+    // one camera ever streamed at a time. The slot lives in m_broadcasts; the
+    // only concurrent writer is deviceStop, which is rare next to frame flow.
+    this->m_broadcastsMutex.unlock();
 
     std::unique_lock<std::mutex> lock(slot.frameMutex);
 
@@ -732,7 +739,6 @@ bool AkVCam::IpcBridgePrivate::frameRequired(const std::string &deviceId,
     lock.unlock();
 
     message = MsgBroadcast(deviceId, currentPid(), frame).toMessage();
-    this->m_broadcastsMutex.unlock();
 
     return run;
 }
