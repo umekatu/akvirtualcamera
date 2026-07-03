@@ -9,13 +9,23 @@ env:
 
 jobs:
   build:
-    runs-on: windows-latest
+    # windows-latest dropped VS 2022 in June 2026 (actions/runner-images#14017)
+    runs-on: windows-2022
     defaults:
       run:
         shell: cmd
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v4
+    - name: Install Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
     - name: Build
       run: ports\ci\windows-vs\build.bat
     - name: Deploy
       run: ports\ci\windows-vs\deploy.bat
+    - name: Upload installer artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: akvirtualcamera-920-installer
+        path: packages/windows/
