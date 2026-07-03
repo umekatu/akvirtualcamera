@@ -83,7 +83,11 @@ bool AkVCam::MessageClient::isUp(uint16_t port)
     sockaddr_in serverAddress;
     serverAddress.sin_family = AF_INET;
     serverAddress.sin_port = htons(port);
-    serverAddress.sin_addr.s_addr = INADDR_ANY;
+    // MLFBT fix: connect to loopback, not INADDR_ANY. 0.0.0.0 is a valid
+    // bind address for the server but an invalid *connect* destination;
+    // Windows 11 rejects it with WSAEADDRNOTAVAIL (10049), breaking the
+    // client/assistant IPC (issues #98/#99). Older Windows tolerated it.
+    serverAddress.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
     // Connect to the server
     if (connect(clientSocket,
@@ -194,7 +198,11 @@ bool AkVCam::MessageClientPrivate::connection(uint16_t port,
     sockaddr_in serverAddress;
     serverAddress.sin_family = AF_INET;
     serverAddress.sin_port = htons(port);
-    serverAddress.sin_addr.s_addr = INADDR_ANY;
+    // MLFBT fix: connect to loopback, not INADDR_ANY. 0.0.0.0 is a valid
+    // bind address for the server but an invalid *connect* destination;
+    // Windows 11 rejects it with WSAEADDRNOTAVAIL (10049), breaking the
+    // client/assistant IPC (issues #98/#99). Older Windows tolerated it.
+    serverAddress.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
     // Connect to the server
     if (connect(clientSocket,
