@@ -268,9 +268,17 @@ bool AkVCam::ServicePrivate::listen(uint64_t clientId,
     auto &slot = this->m_broadcasts[msgListen.device()];
     slot.listeners.push_back({clientId, msgListen.pid()});
 
+    // MLFBT fix: wait with a per-device predicate. m_frameAvailable is a
+    // single global condition variable shared by every device, and the
+    // original wait had no predicate -- so ANY device's broadcast woke ALL
+    // waiting listeners, and every listener whose own frame was not yet set
+    // returned an empty frame (the placeholder). Past ~5 concurrent cameras
+    // the spurious-wake ratio collapsed delivery. Only proceed once THIS
+    // device's frame is actually available.
     if (!slot.frame)
         this->m_frameAvailable.wait_for(this->m_peerMutex,
-                                        std::chrono::seconds(1));
+                                        std::chrono::seconds(1),
+                                        [&slot] { return bool(slot.frame); });
 
     outMessage = MsgFrameReady(msgListen.device(),
                                slot.frame,
