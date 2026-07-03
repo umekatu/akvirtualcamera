@@ -9,7 +9,8 @@ env:
 
 jobs:
   build:
-    runs-on: windows-latest
+    # windows-latest dropped VS 2022 in June 2026 (actions/runner-images#14017)
+    runs-on: windows-2022
     defaults:
       run:
         shell: cmd
