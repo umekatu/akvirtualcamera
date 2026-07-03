@@ -18,9 +18,11 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <future>
 #include <map>
 #include <mutex>
+#include <thread>
 
 #include "messageserver.h"
 #include "logger.h"
@@ -31,7 +33,12 @@ namespace AkVCam
 {
     struct Connection
     {
-        std::future<void> thread;
+        // MLFBT fix: a dedicated OS thread per connection. The original code
+        // used std::async, whose MSVC thread-pool starves under several
+        // long-lived blocking recv() handlers, so only ~2 concurrent
+        // consumers ever received frames (the rest saw the placeholder).
+        std::thread thread;
+        std::atomic<bool> done {false};
         bool run {true};
     };
 
@@ -157,10 +164,11 @@ int AkVCam::MessageServer::run()
 
         this->d->m_clientsMutex.lock();
         auto connection = std::make_shared<Connection>();
-        connection->thread = std::async(&MessageServerPrivate::connection,
-                                        this->d,
-                                        clientSocket,
-                                        connection);
+        connection->thread = std::thread(&MessageServerPrivate::connection,
+                                         this->d,
+                                         clientSocket,
+                                         connection);
+        connection->thread.detach();
         this->d->m_clients.push_back(connection);
         this->d->m_clientsMutex.unlock();
 
@@ -200,12 +208,15 @@ void AkVCam::MessageServerPrivate::cleanup(bool wait)
 
         for (auto it = this->m_clients.begin(); it != this->m_clients.end(); ++it)
             if (wait) {
-                (*it)->thread.wait();
+                // Threads are detached; signal the handler to stop and drop
+                // our reference. The handler owns its own shared_ptr copy and
+                // tears down when its blocking recv() next returns.
+                (*it)->run = false;
                 this->m_clients.erase(it);
                 run = true;
 
                 break;
-            } else if ((*it)->thread.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
+            } else if ((*it)->done) {
                 this->m_clients.erase(it);
                 run = true;
 
@@ -287,4 +298,5 @@ void AkVCam::MessageServerPrivate::connection(SocketType clientSocket,
     AkLogDebug() << "Client disconnected: " << clientId << std::endl;
     this->m_logsMutex.unlock();
     AKVCAM_EMIT(self, ConnectionClosed, clientId)
+    connection->done = true;
 }
