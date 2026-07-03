@@ -67,7 +67,13 @@ namespace AkVCam
 
             // Broadcasting and listen
             Broadcasts m_broadcasts;
-            std::condition_variable_any m_frameAvailable;
+            // MLFBT fix: a condition variable PER DEVICE, not one global CV.
+            // A single global CV meant every device's broadcast notify_all()
+            // woke every waiting listener across all devices (thundering
+            // herd). Past ~5 concurrent cameras the wake storm + contention
+            // collapsed delivery to near zero. Keyed by device id; always
+            // accessed under m_peerMutex.
+            std::map<std::string, std::condition_variable_any> m_frameAvailable;
             std::mutex m_peerMutex;
 
             ServicePrivate();
@@ -241,7 +247,7 @@ bool AkVCam::ServicePrivate::broadcast(uint64_t clientId,
         AkLogDebug() << "Save frame" << std::endl;
         slot.frame = msgBroadcast.frame();
         status = MsgStatus(0, inMessage.queryId());
-        this->m_frameAvailable.notify_all();
+        this->m_frameAvailable[msgBroadcast.device()].notify_all();
     }
 
     this->m_peerMutex.unlock();
@@ -276,9 +282,10 @@ bool AkVCam::ServicePrivate::listen(uint64_t clientId,
     // the spurious-wake ratio collapsed delivery. Only proceed once THIS
     // device's frame is actually available.
     if (!slot.frame)
-        this->m_frameAvailable.wait_for(this->m_peerMutex,
-                                        std::chrono::seconds(1),
-                                        [&slot] { return bool(slot.frame); });
+        this->m_frameAvailable[msgListen.device()].wait_for(
+            this->m_peerMutex,
+            std::chrono::seconds(1),
+            [&slot] { return bool(slot.frame); });
 
     outMessage = MsgFrameReady(msgListen.device(),
                                slot.frame,
