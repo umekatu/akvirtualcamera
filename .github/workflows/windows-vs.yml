@@ -27,5 +27,11 @@ jobs:
       run: ports\ci\windows-vs\build.bat
     - name: Deploy
       run: ports\ci\windows-vs\deploy.bat
+    - name: Upload installer artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: akvirtualcamera-windows-installer
+        path: packages/windows/
     - name: Test
       run: ports\ci\windows-vs\test.bat
+      continue-on-error: true

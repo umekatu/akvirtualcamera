@@ -178,6 +178,13 @@ std::string AkVCam::locateAltMFPluginPath()
 
 bool AkVCam::supportsMediaFoundationVCam()
 {
+    // MLFBT patch: force the DirectShow backend. On Windows 11 the MF
+    // virtual camera activates with E_ACCESSDENIED (see 9.4.1 ChangeLog),
+    // and the MF binaries' presence check below cannot be defeated at
+    // runtime because fileExists() returns true for missing files
+    // (INVALID_FILE_ATTRIBUTES & FILE_ATTRIBUTE_ARCHIVE is non-zero).
+    return false;
+
     auto servicePath = locateMFServicePath();
 
     if (servicePath.empty())
