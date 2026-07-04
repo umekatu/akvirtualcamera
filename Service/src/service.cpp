@@ -287,13 +287,22 @@ bool AkVCam::ServicePrivate::listen(uint64_t clientId,
             std::chrono::seconds(1),
             [&slot] { return bool(slot.frame); });
 
-    outMessage = MsgFrameReady(msgListen.device(),
-                               slot.frame,
-                               slot.broadcaster.pid != 0,
-                               inMessage.queryId()).toMessage();
+    // MLFBT fix: take the frame under the lock, then RELEASE the lock before
+    // serializing it into the response. MsgFrameReady(...).toMessage() copies
+    // and serializes the full (~3 MB) frame; doing that while holding the
+    // global m_peerMutex serialized every camera's delivery and, past ~5
+    // listeners, starved the others until their socket round-trip hit the 5 s
+    // timeout and churned (dropping to the placeholder).
+    VideoFrame frame = std::move(slot.frame);
+    bool active = slot.broadcaster.pid != 0;
     slot.frame = {};
-    ok = true;
     this->m_peerMutex.unlock();
+
+    outMessage = MsgFrameReady(msgListen.device(),
+                               frame,
+                               active,
+                               inMessage.queryId()).toMessage();
+    ok = true;
 
     return ok;
 }
