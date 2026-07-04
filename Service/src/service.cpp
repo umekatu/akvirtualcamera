@@ -56,9 +56,16 @@ namespace AkVCam
         Peer broadcaster;
         std::vector<Peer> listeners;
         VideoFrame frame;
+        // MLFBT fix: hot frame path gets its OWN mutex + CV per device, so
+        // one camera's 3 MB frame store/serialize never blocks another's.
+        // m_peerMutex is reserved for the map + peer metadata only.
+        std::mutex frameMutex;
+        std::condition_variable_any frameAvailable;
     };
 
-    typedef std::map<std::string, BroadcastSlot> Broadcasts;
+    // Held by shared_ptr so a slot survives concurrent map erase while a
+    // frame thread still references it.
+    typedef std::map<std::string, std::shared_ptr<BroadcastSlot>> Broadcasts;
 
     class ServicePrivate
     {
@@ -67,13 +74,9 @@ namespace AkVCam
 
             // Broadcasting and listen
             Broadcasts m_broadcasts;
-            // MLFBT fix: a condition variable PER DEVICE, not one global CV.
-            // A single global CV meant every device's broadcast notify_all()
-            // woke every waiting listener across all devices (thundering
-            // herd). Past ~5 concurrent cameras the wake storm + contention
-            // collapsed delivery to near zero. Keyed by device id; always
-            // accessed under m_peerMutex.
-            std::map<std::string, std::condition_variable_any> m_frameAvailable;
+            // Guards the m_broadcasts map structure + each slot's peer
+            // metadata (broadcaster / listeners). NOT the frame hot path --
+            // that uses each slot's own frameMutex / frameAvailable.
             std::mutex m_peerMutex;
 
             ServicePrivate();
@@ -144,25 +147,25 @@ void AkVCam::ServicePrivate::removeClientById(void *userData,
     std::string removeDevice;
 
     for (auto &slot: self->m_broadcasts) {
-        if (slot.second.broadcaster.clientId == clientId) {
-            slot.second.broadcaster = {0, 0};
+        if (slot.second->broadcaster.clientId == clientId) {
+            slot.second->broadcaster = {0, 0};
 
-            if (slot.second.listeners.empty())
+            if (slot.second->listeners.empty())
                 removeDevice = slot.first;
 
             break;
         } else {
-            auto it = std::find_if(slot.second.listeners.begin(),
-                                   slot.second.listeners.end(),
+            auto it = std::find_if(slot.second->listeners.begin(),
+                                   slot.second->listeners.end(),
                                    [&clientId] (const Peer &peer) -> bool {
                 return peer.clientId == clientId;
             });
 
-            if (it != slot.second.listeners.end()) {
-                slot.second.listeners.erase(it);
+            if (it != slot.second->listeners.end()) {
+                slot.second->listeners.erase(it);
 
-                if (slot.second.broadcaster.pid == 0
-                    && slot.second.listeners.empty()) {
+                if (slot.second->broadcaster.pid == 0
+                    && slot.second->listeners.empty()) {
                     removeDevice = slot.first;
                 }
 
@@ -190,14 +193,14 @@ bool AkVCam::ServicePrivate::clients(uint64_t clientId,
 
     for (auto &slot: this->m_broadcasts) {
         if (msgClients.clientType() == MsgClients::ClientType_Any
-            && slot.second.broadcaster.pid
+            && slot.second->broadcaster.pid
             && std::find(clients.begin(),
                          clients.end(),
-                         slot.second.broadcaster.pid) == clients.end()) {
-            clients.push_back(slot.second.broadcaster.pid);
+                         slot.second->broadcaster.pid) == clients.end()) {
+            clients.push_back(slot.second->broadcaster.pid);
         }
 
-        for (auto &client: slot.second.listeners)
+        for (auto &client: slot.second->listeners)
             if (std::find(clients.begin(),
                           clients.end(),
                           client.pid) == clients.end())
@@ -219,40 +222,35 @@ bool AkVCam::ServicePrivate::broadcast(uint64_t clientId,
     AkLogFunction();
     MsgBroadcast msgBroadcast(inMessage);
     MsgStatus status(-1, inMessage.queryId());
+
+    // Take the slot (and claim broadcaster) under the map/metadata mutex only.
     this->m_peerMutex.lock();
 
-    bool isBroadcasting = this->m_broadcasts.count(msgBroadcast.device()) < 1;
-    AkLogDebug() << "Device" << msgBroadcast.device() << "is broadcasting?:" << (isBroadcasting? "YES": "NO") << std::endl;
-
-    if (isBroadcasting) {
-        AkLogDebug() << "Adding device slot:" << std::endl;
-        AkLogDebug() << "    Device ID:" << msgBroadcast.device() << std::endl;
-        AkLogDebug() << "    Client ID:" << clientId << std::endl;
-        AkLogDebug() << "    Client PID:" << msgBroadcast.pid() << std::endl;
-
+    if (this->m_broadcasts.count(msgBroadcast.device()) < 1)
         this->m_broadcasts[msgBroadcast.device()] =
-            {{clientId, msgBroadcast.pid()}, {}, {}};
-    }
+            std::make_shared<BroadcastSlot>();
 
-    AkLogDebug() << "Get slot" << std::endl;
-    auto &slot = this->m_broadcasts[msgBroadcast.device()];
+    auto slot = this->m_broadcasts[msgBroadcast.device()];
 
-    if (slot.broadcaster.pid == 0) {
-        AkLogDebug() << "Set client as broadcaster" << std::endl;
-        slot.broadcaster = {clientId, msgBroadcast.pid()};
-    }
+    if (slot->broadcaster.pid == 0)
+        slot->broadcaster = {clientId, msgBroadcast.pid()};
 
-    if (slot.broadcaster.pid == msgBroadcast.pid()
-        && slot.broadcaster.clientId == clientId) {
-        AkLogDebug() << "Save frame" << std::endl;
-        slot.frame = msgBroadcast.frame();
-        status = MsgStatus(0, inMessage.queryId());
-        this->m_frameAvailable[msgBroadcast.device()].notify_all();
-    }
+    bool isOwner = slot->broadcaster.pid == msgBroadcast.pid()
+                   && slot->broadcaster.clientId == clientId;
 
     this->m_peerMutex.unlock();
 
-    AkLogDebug() << "Sending the response" << std::endl;
+    // Store the frame under the slot's OWN mutex, not the global one, so a
+    // 3 MB frame store never blocks another camera's delivery.
+    if (isOwner) {
+        {
+            std::lock_guard<std::mutex> frameLock(slot->frameMutex);
+            slot->frame = msgBroadcast.frame();
+        }
+        slot->frameAvailable.notify_all();
+        status = MsgStatus(0, inMessage.queryId());
+    }
+
     outMessage = status.toMessage();
 
     return status.status() == 0;
@@ -266,37 +264,37 @@ bool AkVCam::ServicePrivate::listen(uint64_t clientId,
     MsgListen msgListen(inMessage);
     bool ok = false;
 
+    // Register the listener + take the slot under the map/metadata mutex only.
     this->m_peerMutex.lock();
 
     if (this->m_broadcasts.count(msgListen.device()) < 1)
-        this->m_broadcasts[msgListen.device()] = {};
+        this->m_broadcasts[msgListen.device()] =
+            std::make_shared<BroadcastSlot>();
 
-    auto &slot = this->m_broadcasts[msgListen.device()];
-    slot.listeners.push_back({clientId, msgListen.pid()});
+    auto slot = this->m_broadcasts[msgListen.device()];
+    slot->listeners.push_back({clientId, msgListen.pid()});
+    bool active = slot->broadcaster.pid != 0;
 
-    // MLFBT fix: wait with a per-device predicate. m_frameAvailable is a
-    // single global condition variable shared by every device, and the
-    // original wait had no predicate -- so ANY device's broadcast woke ALL
-    // waiting listeners, and every listener whose own frame was not yet set
-    // returned an empty frame (the placeholder). Past ~5 concurrent cameras
-    // the spurious-wake ratio collapsed delivery. Only proceed once THIS
-    // device's frame is actually available.
-    if (!slot.frame)
-        this->m_frameAvailable[msgListen.device()].wait_for(
-            this->m_peerMutex,
-            std::chrono::seconds(1),
-            [&slot] { return bool(slot.frame); });
-
-    // MLFBT fix: take the frame under the lock, then RELEASE the lock before
-    // serializing it into the response. MsgFrameReady(...).toMessage() copies
-    // and serializes the full (~3 MB) frame; doing that while holding the
-    // global m_peerMutex serialized every camera's delivery and, past ~5
-    // listeners, starved the others until their socket round-trip hit the 5 s
-    // timeout and churned (dropping to the placeholder).
-    VideoFrame frame = std::move(slot.frame);
-    bool active = slot.broadcaster.pid != 0;
-    slot.frame = {};
     this->m_peerMutex.unlock();
+
+    // Wait for and take the frame under the slot's OWN mutex + CV, and
+    // serialize the response AFTER releasing it. Nothing here touches the
+    // global m_peerMutex, so each camera's delivery is fully independent --
+    // this is what lifts the ~5 concurrent-listener ceiling. The per-device
+    // predicate also means only THIS device's broadcast wakes this listener.
+    VideoFrame frame;
+    {
+        std::unique_lock<std::mutex> frameLock(slot->frameMutex);
+
+        if (!slot->frame)
+            slot->frameAvailable.wait_for(
+                frameLock,
+                std::chrono::seconds(1),
+                [&slot] { return bool(slot->frame); });
+
+        frame = std::move(slot->frame);
+        slot->frame = {};
+    }
 
     outMessage = MsgFrameReady(msgListen.device(),
                                frame,
