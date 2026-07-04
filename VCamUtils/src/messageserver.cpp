@@ -264,13 +264,28 @@ void AkVCam::MessageServerPrivate::connection(SocketType clientSocket,
 
         Message outMessage;
 
+        // MLFBT fix: look up the handler under the lock, then RELEASE the
+        // lock BEFORE invoking it. The LISTEN handler blocks up to 1s waiting
+        // for a frame; holding m_handlersMutex across that call serialized
+        // EVERY connection's dispatch (including the producer's BROADCAST that
+        // delivers the awaited frame) through one global lock. Past ~5
+        // concurrent listeners the waits overlapped enough that broadcasts
+        // could not get in, listens timed out, and delivery collapsed to the
+        // placeholder. m_handlers is only mutated at subscribe() time
+        // (startup), so copying the handler out and calling it unlocked is
+        // safe. This is the real fix for the >5 camera ceiling; the per-slot
+        // frameMutex handles the remaining fine-grained frame path.
         this->m_handlersMutex.lock();
         auto hnd = this->m_handlers.find(messageId);
+        MessageServer::MessageHandler handler;
 
         if (hnd != this->m_handlers.end())
-            ok &= hnd->second(clientId, {messageId, queryId, inData}, outMessage);
+            handler = hnd->second;
 
         this->m_handlersMutex.unlock();
+
+        if (handler)
+            ok &= handler(clientId, {messageId, queryId, inData}, outMessage);
 
         if (!ok)
             break;
